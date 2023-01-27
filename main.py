@@ -3,6 +3,11 @@ import cv2
 from pathlib import Path
 from typing import Tuple
 
+from map import Map
+from groundtruth import GroundTruth
+from utils import visualize_keypoint_tracking
+
+
 
 """
 OpenCVを使いVisual Odometryを実装する。
@@ -27,7 +32,7 @@ def main():
                      maxLevel=3,
                      criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
 
-    np.set_printoptions(precision=1, suppress=True)
+    np.set_printoptions(precision=2, suppress=True)
 
     # 処理するフレーム数を指定する。値は１から始まる整数。
     # 大きくなるほどに計算が高速になるが、オプティカルフローによる特徴点追跡が失敗する可能性が高まるトレードオフが発生する点に注意。
@@ -36,8 +41,14 @@ def main():
     # カメラの姿勢検出を行う前に何回トラッキングを行うかを指定する
     # トラッキングの回数が少ない場合は姿勢の変化量が少ないために推定された姿勢が不安定なる
     # 一方で多いと追跡点の多くが画像からはずれてしまうことになる。
-    num_tracking_before_pose_estimation = 5
+    num_tracking_before_pose_estimation = 10
     key_frame_rate = frame_reduction_rate * num_tracking_before_pose_estimation
+
+    # 設定したフレーム数までは正解値をつかってスケールさせることでmapを初期化する。
+    frames_before_initialized = 50
+
+    # 再投影誤差がこの閾値に収まっているものだけを信頼できる特徴点として扱う。
+    reproj_error_threshold = 4.0  # ピクセル
 
     # 真値（ground truth）を扱うクラス
     # ここでは推定された値と真値を見比べて精度を比較するために使われている。
@@ -62,10 +73,13 @@ def main():
 
     # 姿勢変化の時系列情報（軌跡）を初期化する。
     traj_gt = np.array([groundtruth[i]["position_abs"] for i in range(0, len(groundtruth), key_frame_rate)], dtype=np.float32)
-    trajectory = Trajectory(trajectory_gt=traj_gt)
+    map = Map(trajectory_gt=traj_gt)
 
     idx_data = 0
     tracking_count = 0
+
+    initialized = False
+
     for img_path in left_images[frame_reduction_rate:][::frame_reduction_rate]:
         idx_data += frame_reduction_rate
 
@@ -82,56 +96,195 @@ def main():
 
         tracking_count = 0
 
-        # ここから姿勢推定をおこなう
-        # 追跡がうまく行っている点のみを使う
+        # ここから姿勢推定を実行する
         kp_curr_good = kp_curr[status == 1][:, np.newaxis]
         kp_keyf_good = kp_keyf[status == 1][:, np.newaxis]
-        # 基本行列を計算する
-        E, mask = cv2.findEssentialMat(kp_curr_good, kp_keyf_good, cameraMatrix=K, method=cv2.RANSAC, prob=0.99, threshold=1)
-        # 基本行列から回転と並進を取り出す
-        points, R, t, _ = cv2.recoverPose(E, kp_curr_good, kp_keyf_good, cameraMatrix=K, mask=mask)
+        if "point_4d" in locals() and point_4d is not None:
+            point_4d = point_4d[(status[:len(point_4d)] == 1).squeeze(1)]
 
-        # 並進（ｔ）のノルムは常に1となり、(a)隣接するフレームとのスケール比、(b)実際のスケールとの対応がわからない
-        # 現在はインチキで真値を用いて(a)(b) の両方を解決しているが、本来は(a)は解決可能な問題なので後日取り組む
-        # FIXME: 隣接フレームとのスケール比率を三角測量を用いて計算するように変更する
-        trans_abs_scale = groundtruth[idx_data]["trans_abs_scale"]
-        t_scaled = t * trans_abs_scale
+        if not initialized:  # 初期化中
+            # 真値とスケールを合わせるために初期化時には正解をつかって推定された並進をスケールさせる
+            trans_abs_scale = groundtruth[idx_data]["trans_abs_scale"]
+            RT_curr, point_4d, kp_keyf_good, kp_curr_good = two_view_sfm_for_init(kp_keyf_good, kp_curr_good, K, trans_abs_scale)
 
-        # 並進と回転を一つの行列（４ｘ４）にする
-        RT = np.eye(4)
-        RT[:3, :4] = np.concatenate([R, t_scaled], axis=1)
+            # 姿勢推定ができなかった場合は次のフレームで再実行する
+            if RT_curr is None:
+                continue
 
-        # 軌跡情報を更新して表示する
-        trajectory.append(RT)
-        trajectory.show()
+            if idx_data > frames_before_initialized:
+                initialized = True
+
+        else:  # 初期化後
+            RT_curr, point_4d, kp_keyf_good, kp_curr_good = solvePnP_and_get_new_3dpoints(RT_keyf, kp_keyf_good, kp_curr_good, point_4d, K, reproj_error_threshold)
+
+        map.append(np.linalg.inv(RT_curr), point_4d)
+        map.show()
+
         # 特徴点追跡の状況を表示する（別窓）
-        visualize_keypoint_tracking(img_curr, kp_curr_good, kp_keyf_good)
+        visualize_keypoint_tracking(img_curr, kp_curr_good, kp_keyf_good, idx_data)
         # ターミナルにも表示する
-        print("position (inference, groudtruth)", trajectory.trajectory[-1], groundtruth[idx_data]["position_abs"])
+        print("position (inference, groudtruth)", map.trajectory[-1], groundtruth[idx_data]["position_abs"])
 
         # 次のループのための入れ替え
-        kp_curr, _ = kpdet.detect(img_curr)
+        kp_curr, point_4d = update_keypoints(kpdet, img_curr, kp_curr_good, point_4d)
         img_prev = img_curr
         kp_prev = kp_curr
         kp_keyf = kp_prev
+        RT_keyf = RT_curr
+
+
+def two_view_sfm_for_init(kp_keyf_good: np.ndarray, kp_curr_good: np.ndarray, K: np.ndarray, trans_abs_scale: float):
+    # 基本行列を計算する
+    E, mask = cv2.findEssentialMat(kp_keyf_good, kp_curr_good, cameraMatrix=K, method=cv2.RANSAC, prob=0.99, threshold=1)
+
+    # 基本行列から回転と並進を取り出す
+    points, R, tvecs, mask = cv2.recoverPose(E, kp_keyf_good, kp_curr_good, cameraMatrix=K, mask=mask)
+    tvecs = tvecs * trans_abs_scale
+
+    # 外れ値を取り除く
+    kp_curr_good = kp_curr_good[mask.ravel()==1]
+    kp_keyf_good = kp_keyf_good[mask.ravel()==1]
+
+    # 十分なキーポイントが得られていない場合は処理を中断する。
+    if len(kp_curr_good) < 20:
+        print("0:", len(kp_curr_good), len(kp_keyf_good))
+        return None, None, None, None
+
+    RT_relative = np.eye(4, 4)
+    RT_relative[:3, :4] = np.concatenate([R, tvecs], axis=1)
+
+    # 射影行列を作成する。
+    if not "RT_keyf" in locals():
+        RT_keyf = np.eye(4, 4)
+    RT_curr = RT_relative @ RT_keyf
+    Proj_keyf = np.dot(K, RT_keyf[:3])
+    Proj_curr = np.dot(K, RT_curr[:3])
+
+    # triangulate points
+    point_4d = cv2.triangulatePoints(Proj_keyf, Proj_curr, kp_keyf_good, kp_curr_good)
+    point_4d = point_4d / np.tile(point_4d[-1, :], (4, 1))
+    point_4d = point_4d[:, :].T
+
+    print("reproj error: ", np.mean(compute_reproj_error(Proj_curr, point_4d, kp_curr_good.squeeze(1))))
+
+    return RT_curr, point_4d, kp_keyf_good, kp_curr_good
+
+
+def solvePnP_and_get_new_3dpoints(RT_keyf: np.ndarray, kp_keyf_good: np.ndarray, kp_curr_good: np.ndarray, point_4d: np.ndarray, K: np.ndarray, reproj_error_threshold: float):
+    kp_curr_good_3d_known = kp_curr_good[:len(point_4d)]
+    kp_curr_good_3d_unknown = kp_curr_good[len(point_4d):]
+    kp_keyf_good_3d_known = kp_keyf_good[:len(point_4d)]
+    kp_keyf_good_3d_unknown = kp_keyf_good[len(point_4d):]
+
+    _, rvecs, tvecs, inliers = cv2.solvePnPRansac(point_4d[:, :3], kp_curr_good_3d_known.squeeze(1), cameraMatrix=K, distCoeffs=None)
+
+    kp_curr_good_3d_known = kp_curr_good_3d_known[inliers].squeeze(1)
+    kp_keyf_good_3d_known = kp_keyf_good_3d_known[inliers].squeeze(1)
+    point_4d = point_4d[inliers].squeeze(1)
+
+    kp_curr_good = np.concatenate([kp_curr_good_3d_known, kp_curr_good_3d_unknown], axis=0)
+    kp_keyf_good = np.concatenate([kp_keyf_good_3d_known, kp_keyf_good_3d_unknown], axis=0)
+
+    R, Jacob = cv2.Rodrigues(rvecs)
+
+    # 軌跡情報を更新して表示する
+    # 並進と回転を一つの行列（４ｘ４）にする
+    # TODO: 上で作っている行列と重複があるので統一する
+    RT_curr = np.eye(4)
+    RT_curr[:3, :4] = np.concatenate([R, tvecs], axis=1)
+
+    RT_relative = RT_curr @ np.linalg.inv(RT_keyf)
+
+    # 射影行列を作成する。
+    Proj_keyf = np.dot(K,  RT_keyf[:3])
+    Proj_curr = np.dot(K,  RT_curr[:3])
+
+    # 現在のフレームにpoint_4dを投影して誤差を確認する。
+    print(rvecs, tvecs, "\n", "reproj error: ", np.mean(compute_reproj_error(Proj_curr, point_4d, kp_curr_good_3d_known.squeeze(1))))
+
+    # triangulate points
+    point_4d_new = cv2.triangulatePoints(Proj_keyf, Proj_curr, kp_keyf_good, kp_curr_good)
+    point_4d_new = point_4d_new / np.tile(point_4d_new[-1, :], (4, 1))
+    point_4d_new = point_4d_new[:, :].T
+
+    reproj_error = compute_reproj_error(Proj_curr, point_4d_new, kp_curr_good.squeeze(1))
+    print("reproj error: ", np.mean((reproj_error)))
+
+    # TODO: point4d_newのなかで再投影誤差がすくないものだけを採用する。
+    point_4d = point_4d_new[reproj_error <= reproj_error_threshold]
+    kp_curr_good = kp_curr_good[reproj_error <= reproj_error_threshold]
+    kp_keyf_good = kp_keyf_good[reproj_error <= reproj_error_threshold]
+
+    return RT_curr, point_4d, kp_keyf_good, kp_curr_good
+
+
+def compute_reproj_error(Proj, point_4d, point_image):
+    point_image_reproj = Proj @ point_4d.T  # (4, N)
+    point_image_reproj = point_image_reproj.T
+    point_image_reproj = point_image_reproj / point_image_reproj[:, [2]]
+    error = np.linalg.norm(point_image - point_image_reproj[:, :2], axis=1)
+    return error
+
+
+def update_keypoints(kpdet, img_curr, kp_curr, points_4d, min_keypoins=400):
+    """キーポイントを検出して既存のキーポイントと重複していないものを処理対象に加える。画面外に移動したキーポイントは除去する。
+
+    Args:
+        kpdet (_type_): キーポイント検出器
+        img_curr (_type_): 現在の画像
+        kp_curr (_type_): 既存のキーポイント
+    """
+    assert(len(kp_curr) == len(points_4d)), f"{len(kp_curr)}, {len(points_4d)}"
+
+    x_in_frame = np.logical_and(
+        kp_curr[:, :, 0] >= 0,
+        kp_curr[:, :, 0] < img_curr.shape[1]
+    )
+    y_in_frame = np.logical_and(
+        kp_curr[:, :, 1] >= 0,
+        kp_curr[:, :, 1] < img_curr.shape[0]
+    )
+    xy_both_in_frame = np.logical_and(x_in_frame, y_in_frame)
+    xy_both_in_frame = xy_both_in_frame.squeeze(axis=1)
+    kp_curr = kp_curr[xy_both_in_frame]
+    points_4d = points_4d[xy_both_in_frame]
+
+    if len(kp_curr) > min_keypoins:
+        return kp_curr, points_4d
+
+    kp_new, _ = kpdet.detect(img_curr)
+
+    # init maps
+    map_shape = img_curr.shape[:2]
+    map_inds_new = np.ones(map_shape, dtype=np.int32) * -1
+    map_curr_bitmap = np.zeros(map_shape)
+    map_new_bitmap = np.zeros(map_shape)
+
+    kp_new_inds = np.array(list(range(len(kp_new))), dtype=np.int32)
+
+    kp_curr_idx_x = kp_curr[:, :, 0].astype(np.int32).squeeze(-1)
+    kp_curr_idx_y = kp_curr[:, :, 1].astype(np.int32).squeeze(-1)
+    kp_new_idx_x = kp_new[:, :, 0].astype(np.int32).squeeze(-1)
+    kp_new_idx_y = kp_new[:, :, 1].astype(np.int32).squeeze(-1)
+
+    map_inds_new[kp_new_idx_y, kp_new_idx_x] = kp_new_inds
+
+    map_curr_bitmap[kp_curr_idx_y, kp_curr_idx_x] = 2
+    map_new_bitmap[kp_new_idx_y, kp_new_idx_x] = 1
+
+    map_curr_bitmap = cv2.dilate(map_curr_bitmap, kernel=np.ones((9, 9)))
+    map_curr_new_bitmap = np.stack([map_curr_bitmap, map_new_bitmap], axis=2)
+    map_curr_new_bitmap = np.max(map_curr_new_bitmap, axis=2)
+
+    kp_new_append_inds = map_inds_new[map_curr_new_bitmap == 1]
+    kp_new_append = kp_new[kp_new_append_inds]
+    kp_all = np.concatenate([kp_curr, kp_new_append], axis=0)
+
+    return kp_all, points_4d
 
 
 def load_image(img_path: Path):
     return cv2.imread(str(img_path), 0)
-
-
-def visualize_keypoint_tracking(img_curr, kp_curr_good, kp_keyf_good):
-    img_debug = cv2.cvtColor(img_curr, cv2.COLOR_GRAY2BGR)
-    color = np.random.randint(0, 255, (kp_curr_good.shape[0], 3))  # create some random colors# create some random colors
-    mask_draw = np.zeros((img_curr.shape[0], img_curr.shape[1], 3)).astype(np.uint8)
-    for i, (curr, keyf) in enumerate(zip(kp_curr_good, kp_keyf_good)):
-        a, b = curr.astype(np.int).ravel()
-        c, d = keyf.astype(np.int).ravel()
-        mask_draw = cv2.line(mask_draw, (a, b), (c, d), color[i].tolist(), 2)
-        img_debug = cv2.circle(img_debug, (a, b), 5, color[i].tolist(), -1)
-    img_debug = cv2.add(img_debug, mask_draw)
-    cv2.imshow("optical flow", img_debug)
-    cv2.waitKey(-1)
 
 
 class KeyPointDetector:
@@ -146,110 +299,6 @@ class KeyPointDetector:
     @classmethod
     def kp_in_umat(cls, kps: Tuple[cv2.KeyPoint]):
         return np.array([kp.pt for kp in list(kps)], np.float32)[:, np.newaxis]
-
-
-class Trajectory():
-    def __init__(self, trajectory_gt=None):
-        self.trajectory = np.array([[0., 0., 0.]], dtype=np.float32)
-        self.trajectory_gt = trajectory_gt
-        self.poses = [np.eye(4)]
-        self.x_range = (-1000, 1000)
-        self.z_range = (-1000, 1000)
-        self.viz_width = self.x_range[1] - self.x_range[0]
-        self.viz_height = self.z_range[1] - self.z_range[0]
-        self.viz_img_traj = None
-        self.viz_xz_center = np.array([self.viz_width / 2, self.viz_height / 2])
-        self.viz_pos_last = 0
-        self.vis_point_color = np.array([0, 255, 0])
-        self.vis_point_color_gt = np.array([0, 0, 255])
-
-        # 真値を可視化したところ、初期姿勢のZは負の方向に向いているようだったのでそれに合わせる。
-        self.poses[0][2, 2] = -1
-
-    def append(self, pose):
-        pose_last = self.poses[-1]
-        pose_curr = pose_last @ pose
-        position_curr = pose_curr[:, 3][:-1]
-        self.poses.append(pose_curr)
-        self.trajectory = np.append(self.trajectory, position_curr[np.newaxis], axis=0)
-
-    def update_vis(self):
-        self.viz_img_traj = np.zeros((self.viz_height, self.viz_width, 3), dtype=np.uint8)
-
-        # TopView表示（X,Zのみ表示）、画像の中央を原点（０，０）として表示するために座標をシフトする
-        trajectory_xz = self.trajectory[:, [0, 2]]
-        trajectory_xz += self.viz_xz_center
-        trajectory_xz = trajectory_xz.astype(np.int32)
-        trajectory_x = trajectory_xz[:, 0]
-        trajectory_z = trajectory_xz[:, 1]
-
-        # 画像外の点を除外しておく（除外しないと例外が起きるため）
-        x_valid = np.logical_and(trajectory_x >= 0, trajectory_x < self.viz_width)
-        z_valid = np.logical_and(trajectory_z >= 0, trajectory_z < self.viz_height)
-        valid = np.logical_and(x_valid, z_valid)
-
-        self.viz_img_traj[trajectory_z[valid], trajectory_x[valid]] = self.vis_point_color
-
-        if self.trajectory_gt is not None:
-            # 与えられていれば真値も表示する
-            trajectory_gt_xz = self.trajectory_gt[:len(self.trajectory)][:, [0, 2]]
-            trajectory_gt_xz += self.viz_xz_center
-            trajectory_gt_x = trajectory_gt_xz[:, 0].astype(np.int32)
-            trajectory_gt_z = trajectory_gt_xz[:, 1].astype(np.int32)
-            self.viz_img_traj[trajectory_gt_z, trajectory_gt_x] = self.vis_point_color_gt
-
-        # １画素の点を３画素に大きくして見やすくする
-        self.viz_img_traj = cv2.dilate(self.viz_img_traj, np.ones((3, 3)), iterations=1)
-
-    def show(self):
-        self.update_vis()
-        cv2.imshow("trajectory", self.viz_img_traj)
-        cv2.waitKey(0)
-
-
-class GroundTruth:
-
-    def __init__(self, key_frame_rate, path_camera_track="data/NewTsukubaStereoDataset/groundtruth/camera_track.txt"):
-        self.data = self.load_camera_track(path_camera_track)
-        self.key_frame_rate = key_frame_rate
-
-    def load_camera_track(self, path):
-        with open(path) as f:
-            lines = f.readlines()
-            data = [line.strip().split(',') for line in lines]
-            data = [[float(val.strip()) for val in row] for row in data]
-        return data
-
-    def __getitem__(self, idx):
-        """
-        returns:
-        * current pose (position, rotation) in world coordinate
-        * translation (X, Y, Z)
-        * absolute scale of translation from previsious frame
-        """
-        item = self.data[idx]
-        x, y, z, a, b, c = item[0:6]
-
-        if idx != 0:
-            item_prev = self.data[idx - self.key_frame_rate]
-            x_p, y_p, z_p, a_p, b_p, c_p = item_prev[0:6]
-            trans = np.array([x - x_p, y - y_p, z - z_p])
-            scale_abs = np.linalg.norm(trans)
-            rotation = np.array([a - a_p, b - b_p, c - c_p])
-        else:
-            trans = np.array([0., 0., 0.])
-            scale_abs = 0.0
-            rotation = np.array([0.0, 0.0, 0.0])
-        return {
-            "position_abs": [x, y, z],
-            "rotatoin_abs": [a, b, c],
-            "rotation": rotation,
-            "trans": trans,
-            "trans_abs_scale": scale_abs,
-        }
-
-    def __len__(self):
-        return len(self.data)
 
 
 if __name__ == "__main__":
